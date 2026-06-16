@@ -385,6 +385,139 @@ def mc_uncertainty_propagation(
     return mc_diffs
 
 
+def radial_density_profile(
+    df: pd.DataFrame,
+    radius: str = "R3D",
+    bin_edges: np.ndarray | None = None,
+    geometry: str = "sphere",
+) -> dict:
+    """Stellar number density n(R) vs. galactocentric (heliocentric) radius.
+
+    Density is counts divided by shell volume (``geometry='sphere'``, for 3-D
+    radius) or annulus area (``geometry='annulus'``, for projected radius). Used
+    to show the two-population separation that motivates the contrast boundary:
+    the density peaks at small R and falls smoothly outward, so the boundary
+    lies in the low-density region between the nearby and distant populations.
+    """
+    df = df.copy()
+    if radius == "R3D":
+        r = np.sqrt(df["X"] ** 2 + df["Y"] ** 2 + df["Z"] ** 2).to_numpy()
+    elif radius == "R_xy":
+        r = (
+            df["R_xy"].to_numpy()
+            if "R_xy" in df.columns
+            else np.sqrt(df["X"] ** 2 + df["Y"] ** 2).to_numpy()
+        )
+    else:
+        raise ValueError("radius must be 'R3D' or 'R_xy'")
+
+    if bin_edges is None:
+        bin_edges = np.arange(0.0, 121.0, 20.0)
+    bin_edges = np.asarray(bin_edges, dtype=float)
+    centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    count, _ = np.histogram(r, bins=bin_edges)
+
+    if geometry == "sphere":
+        shell = (4.0 / 3.0) * np.pi * (bin_edges[1:] ** 3 - bin_edges[:-1] ** 3)
+    elif geometry == "annulus":
+        shell = np.pi * (bin_edges[1:] ** 2 - bin_edges[:-1] ** 2)
+    else:
+        raise ValueError("geometry must be 'sphere' or 'annulus'")
+
+    density = np.divide(count, shell, out=np.full_like(shell, np.nan), where=shell > 0)
+    return dict(
+        radius=radius,
+        bin_edges=bin_edges,
+        centers=centers,
+        count=count,
+        density=density,
+        geometry=geometry,
+    )
+
+
+def radial_vsini_profile(
+    df: pd.DataFrame,
+    radius: str = "R3D",
+    bin_edges: np.ndarray | None = None,
+    vsini_col: str = "vsini",
+    weight_col: str = "w_vmax",
+    use_weights: bool = True,
+    n_bootstrap: int = 1000,
+    seed: int | None = 42,
+) -> dict:
+    """Weighted v sin i as a function of galactocentric radius (per star).
+
+    This is independent of the 2-D display grid: stars are binned by their own
+    radius, so the profile is not tied to the 20 pc cell size. It provides the
+    quantitative anchor for the transition-scale claim in the text.
+
+    ``radius`` selects ``"R3D"`` (sqrt(X^2+Y^2+Z^2)) or ``"R_xy"`` (projected).
+    Returns bin centres, weighted mean and weighted quartiles per bin, the
+    bootstrap standard error of the mean, and per-bin counts.
+    """
+    df = df.copy()
+    if radius == "R3D":
+        r = np.sqrt(df["X"] ** 2 + df["Y"] ** 2 + df["Z"] ** 2).to_numpy()
+    elif radius == "R_xy":
+        r = (
+            df["R_xy"].to_numpy()
+            if "R_xy" in df.columns
+            else np.sqrt(df["X"] ** 2 + df["Y"] ** 2).to_numpy()
+        )
+    else:
+        raise ValueError("radius must be 'R3D' or 'R_xy'")
+
+    v = df[vsini_col].to_numpy()
+    w = df[weight_col].to_numpy() if use_weights else np.ones_like(v, dtype=float)
+
+    if bin_edges is None:
+        bin_edges = np.arange(0.0, 121.0, 20.0)
+    bin_edges = np.asarray(bin_edges, dtype=float)
+    centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    nb = len(centers)
+
+    mean = np.full(nb, np.nan)
+    q25 = np.full(nb, np.nan)
+    q50 = np.full(nb, np.nan)
+    q75 = np.full(nb, np.nan)
+    se = np.full(nb, np.nan)
+    count = np.zeros(nb, dtype=int)
+
+    rng = np.random.default_rng(seed)
+    for i in range(nb):
+        m = (r >= bin_edges[i]) & (r < bin_edges[i + 1])
+        n = int(m.sum())
+        count[i] = n
+        if n == 0:
+            continue
+        vi, wi = v[m], w[m]
+        mean[i] = weighted_mean(vi, wi)
+        q25[i] = weighted_percentile(vi, wi, 25)
+        q50[i] = weighted_percentile(vi, wi, 50)
+        q75[i] = weighted_percentile(vi, wi, 75)
+        if n > 1 and n_bootstrap > 0:
+            # bootstrap the weighted mean; resample probabilities ~ weights so
+            # this matches the 1/Vmax-weighted resampling used for the maps.
+            p = wi / wi.sum() if use_weights else None
+            boots = np.empty(n_bootstrap)
+            for b in range(n_bootstrap):
+                idx = rng.choice(n, size=n, replace=True, p=p)
+                boots[b] = weighted_mean(vi[idx], wi[idx])
+            se[i] = float(np.std(boots, ddof=1))
+
+    return dict(
+        radius=radius,
+        bin_edges=bin_edges,
+        centers=centers,
+        mean=mean,
+        q25=q25,
+        q50=q50,
+        q75=q75,
+        se=se,
+        count=count,
+    )
+
+
 def weighted_median_contrast(
     df: pd.DataFrame,
     r_cut: float = 80.0,

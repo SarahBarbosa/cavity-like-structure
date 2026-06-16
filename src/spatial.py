@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 from scipy.interpolate import RectBivariateSpline
+from scipy.ndimage import gaussian_filter, zoom
 
 
 def weighted_percentile(values: np.ndarray, weights: np.ndarray, q: float) -> float:
@@ -103,8 +104,17 @@ def compute_grid_stats(
     )
 
 
-def interpolate_map(grid_2d: np.ndarray, factor: int = 5) -> np.ndarray:
-    """Smooth a 2-D grid with a bicubic spline."""
+def interpolate_map(
+    grid_2d: np.ndarray, factor: int = 5, remask: bool = True
+) -> np.ndarray:
+    """Smooth a 2-D grid with a bicubic spline, keeping empty cells masked.
+
+    Cells that are NaN on input (masked / low-count) are temporarily filled
+    only so the spline stays numerically stable, but the corresponding
+    regions of the up-sampled output are set back to NaN when ``remask`` is
+    True. This prevents "no data" cells from being painted as a real (often
+    low) value on the colour scale -- see the referee's Major Comment 3.
+    """
     Ny, Nx = grid_2d.shape
     nan_mask = np.isnan(grid_2d)
     filled = grid_2d.copy()
@@ -119,13 +129,51 @@ def interpolate_map(grid_2d: np.ndarray, factor: int = 5) -> np.ndarray:
     y_fine = np.linspace(0, Ny - 1, Ny * factor)
     result = spl(y_fine, x_fine)
 
-    # Restore NaN regions (upscaled)
-    # nan_coarse = nan_mask.astype(float)
-    # nan_spl = RectBivariateSpline(y_coarse, x_coarse, nan_coarse, kx=1, ky=1)
-    # nan_fine = nan_spl(y_fine, x_fine)
-    # result[nan_fine > 0.1] = np.nan
+    # Re-mask the up-sampled empty regions: propagate the NaN footprint to
+    # the fine grid with nearest-neighbour (kx=ky=1, threshold) interpolation.
+    if remask and nan_mask.any():
+        nan_coarse = nan_mask.astype(float)
+        nan_spl = RectBivariateSpline(y_coarse, x_coarse, nan_coarse, kx=1, ky=1)
+        nan_fine = nan_spl(y_fine, x_fine)
+        result[nan_fine > 0.5] = np.nan
 
     return result
+
+
+def smooth_masked_field(
+    grid_2d: np.ndarray,
+    factor: int = 8,
+    mask_sigma: float = 0.5,
+    mask_level: float = 0.6,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Up-sample a gridded field and clip it to a de-pixelated data footprint.
+
+    Returns ``(field, footprint)`` where ``field`` is a float array up-sampled
+    by ``factor`` (NaN outside the footprint) and ``footprint`` is the smoothed
+    valid-cell mask on the same up-sampled grid (useful for drawing an outline).
+
+    Important (scientific honesty): this does NOT extrapolate the measured
+    quantity into empty cells. The interior is interpolated only across cells
+    that already hold data; the boundary is a *morphologically smoothed* version
+    of the hard ``count >= min_count`` footprint. The smoothing rounds pixel
+    corners roughly symmetrically -- with the default ``mask_sigma`` /
+    ``mask_level`` the footprint area changes by ~1% (sub-cell), so no
+    appreciable coverage is added beyond where stars exist. ``mask_level`` above
+    0.5 keeps the boundary from bulging outward.
+    """
+    valid = np.isfinite(grid_2d).astype(float)
+
+    # Interior field: interpolate WITHOUT re-masking (fill is only for spline
+    # stability); the explicit footprint mask below decides what is shown.
+    field = interpolate_map(grid_2d, factor=factor, remask=False)
+
+    # Smooth footprint: up-sample the binary valid mask, blur, threshold.
+    vm_up = zoom(valid, factor, order=1)
+    vm_blur = gaussian_filter(vm_up, sigma=mask_sigma * factor)
+    footprint = vm_blur >= mask_level
+
+    field = np.where(footprint, field, np.nan)
+    return field, vm_blur
 
 
 def compute_bootstrap_grid(
@@ -224,23 +272,28 @@ def vsini_maps_for_plane(
     Nx = len(ttx) - 1
     Ny = len(tty) - 1
 
-    meanoriginal = np.zeros((Ny, Nx))
-    meanoriginalSD = np.zeros((Ny, Nx))
-    percentile25 = np.zeros((Ny, Nx))
-    percentile50 = np.zeros((Ny, Nx))
-    percentile75 = np.zeros((Ny, Nx))
+    # Statistic maps are initialised to NaN so that masked / low-count cells
+    # (count < min_count) are flagged as "no data" rather than carrying a real
+    # value of 0, which would otherwise render as a low value on the velocity
+    # colour scale (referee Major Comment 3). The count map stays at 0 because
+    # there a 0 is a genuine measurement (no stars).
+    meanoriginal = np.full((Ny, Nx), np.nan)
+    meanoriginalSD = np.full((Ny, Nx), np.nan)
+    percentile25 = np.full((Ny, Nx), np.nan)
+    percentile50 = np.full((Ny, Nx), np.nan)
+    percentile75 = np.full((Ny, Nx), np.nan)
 
-    meanbootstrap = np.zeros((Ny, Nx))
-    meanbootstrapSD = np.zeros((Ny, Nx))
-    percentile25boot = np.zeros((Ny, Nx))
-    percentile50boot = np.zeros((Ny, Nx))
-    percentile75boot = np.zeros((Ny, Nx))
+    meanbootstrap = np.full((Ny, Nx), np.nan)
+    meanbootstrapSD = np.full((Ny, Nx), np.nan)
+    percentile25boot = np.full((Ny, Nx), np.nan)
+    percentile50boot = np.full((Ny, Nx), np.nan)
+    percentile75boot = np.full((Ny, Nx), np.nan)
 
-    boot_mean = np.zeros((Ny, Nx))
-    boot_se = np.zeros((Ny, Nx))
-    ci1 = np.zeros((Ny, Nx))
-    ci2 = np.zeros((Ny, Nx))
-    shape = np.zeros((Ny, Nx))
+    boot_mean = np.full((Ny, Nx), np.nan)
+    boot_se = np.full((Ny, Nx), np.nan)
+    ci1 = np.full((Ny, Nx), np.nan)
+    ci2 = np.full((Ny, Nx), np.nan)
+    shape = np.full((Ny, Nx), np.nan)
     countfXY = np.zeros((Ny, Nx))
 
     for j in range(Nx):
